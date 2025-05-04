@@ -1,0 +1,179 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8" />
+    <title>WebRTC 文件传输</title>
+    <script src="https://cdn.jsdelivr.net/npm/streamsaver@2.0.5/StreamSaver.min.js"></script>
+    <script>
+        let pc;
+        let dataChannel;
+        let file;
+        const ws = new WebSocket('ws://localhost:3000');
+        let fileStream;
+        let writer;
+        let totalReceived = 0;
+        ws.onopen = () => {
+            console.log('[WebSocket] 已连接到信令服务器');
+            console.log('[WebRTC] 创建 PeerConnection');
+            pc = new RTCPeerConnection();
+
+            pc.onicecandidate = (event) => {
+                if (event.candidate) {
+                    console.log('[ICE] 发送 ICE 候选:', event.candidate);
+                    ws.send(JSON.stringify({ candidate: event.candidate }));
+                }
+            };
+
+            pc.oniceconnectionstatechange = () => {
+                console.log('[ICE] 连接状态变化:', pc.iceConnectionState);
+            };
+            pc.ondatachannel = (event) => {
+                    console.log('[WebRTC] 收到 DataChannel');
+                    dataChannel = event.channel;
+                    setupDataChannel();
+            };
+        };
+
+        ws.onerror = (err) => {
+            console.error('[WebSocket] 错误:', err);
+        };
+
+        ws.onclose = () => {
+            console.log('[WebSocket] 已断开连接');
+        };
+
+        ws.onmessage = async (event) => {
+            let data;
+            if (typeof event.data === 'string') {
+                data = event.data;
+            } else {
+                // 处理 Blob 或 ArrayBuffer
+                data = await event.data.text();  // 转换成字符串
+            }
+
+            const message = JSON.parse(data);
+            console.log('[WebSocket] 收到信令消息:', message);
+            if (message.type === 'offer') {
+                console.log('[信令] 收到 offer');
+                await pc.setRemoteDescription(new RTCSessionDescription(message));
+                const answer = await pc.createAnswer();
+                await pc.setLocalDescription(answer);
+                console.log('[信令] 发送 answer');
+                ws.send(JSON.stringify(pc.localDescription));
+            } else if (message.type === 'answer') {
+                console.log('[信令] 收到 answer');
+                await pc.setRemoteDescription(new RTCSessionDescription(message));
+            } else if (message.candidate) {
+                console.log('[信令] 收到 ICE 候选:', message.candidate);
+                try {
+                    await pc.addIceCandidate(new RTCIceCandidate(message.candidate));
+                } catch (e) {
+                    console.error('[ICE] 添加候选失败:', e);
+                }
+            }
+        };
+
+
+        function setupDataChannel() {
+            dataChannel.onopen = () => {
+                console.log('[DataChannel] 已打开');
+                if (file){
+                    do_send()
+                }
+            };
+            dataChannel.onclose = () => {
+                console.log('[DataChannel] 已关闭');
+            };
+            dataChannel.onerror = (error) => {
+                console.error('[DataChannel] 错误:', error);
+            };
+            dataChannel.onmessage = async (event) => {
+                await do_save()
+            };
+        }
+
+        function sendFile() {
+            console.log('[WebRTC] 作为发起方，创建 DataChannel');
+            dataChannel = pc.createDataChannel('file');
+            setupDataChannel();
+            pc.createOffer().then(offer => {
+                console.log('[信令] 发送 offer');
+                pc.setLocalDescription(offer);
+                ws.send(JSON.stringify(offer));
+            });
+            const fileInput = document.getElementById('fileInput');
+            file = fileInput.files[0];
+        }
+        function do_send(){
+            console.log('[文件] 读取文件:', file.name, '大小:', file.size, '字节');
+            const chunkSize = 16384;  // 16KB
+            let offset = 0;
+
+            function readSlice(o) {
+                const slice = file.slice(o, o + chunkSize);
+                const reader = new FileReader();
+                reader.onload = (e) => {
+                    // 节流：等待 bufferedAmount 降到安全值再发
+                    const sendChunk = () => {
+                        if (dataChannel.bufferedAmount > 4 * 1024 * 1024) {  // 4MB 阈值
+                            setTimeout(sendChunk, 100);  // 等一会儿再试
+                        } else {
+                            dataChannel.send(e.target.result);
+                            offset += e.target.result.byteLength;
+                            console.log(`[文件] 已发送 ${offset}/${file.size} 字节 (${Math.floor(offset / file.size * 100)}%)`);
+
+                            if (offset < file.size) {
+                                readSlice(offset);
+                            } else {
+                                console.log('[文件] 发送完成');
+                                dataChannel.send(JSON.stringify({ done: true, fileName: file.name }));
+                            }
+                        }
+                    };
+                    sendChunk();
+                };
+                reader.onerror = (err) => {
+                    console.error('[文件] 读取错误:', err);
+                };
+                reader.readAsArrayBuffer(slice);
+            }
+
+            console.log('[文件] 开始分片发送...');
+            readSlice(0);
+        }
+        async function do_save(){
+            if (typeof event.data === 'string') {
+                // 检查是否是结束标志
+                try {
+                    const msg = JSON.parse(event.data);
+                    if (msg.done) {
+                        console.log('[文件] 接收完成，关闭写入流');
+                        writer.close();
+                    }
+                } catch (e) {
+                    console.log('[DataChannel] 收到文本消息:', event.data);
+                }
+            } else {
+                if (!writer) {
+                    // 初始化保存流 (首次收到数据时)
+                    console.log('[文件] 开始保存流式文件...');
+                    //fileStream = streamSaver.createWriteStream('received_file');
+                    fileStream = streamSaver.createWriteStream('example.mp4', {
+                        size: 1_000_000_000, // 可选，但推荐：更容易告诉浏览器做预分配
+                    });
+                    writer = fileStream.getWriter();
+                }
+                totalReceived += event.data.byteLength;
+                console.log('[DataChannel] 收到块:', event.data.byteLength, '总共:', totalReceived);
+                await writer.write(event.data);
+            }
+        }
+    </script>
+</head>
+<body>
+    <h1>WebRTC 文件传输</h1>
+    <br><br>
+    <input type="file" id="fileInput" />
+    <button onclick="sendFile()">发送文件</button>
+</body>
+</html>
